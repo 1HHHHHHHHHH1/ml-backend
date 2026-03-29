@@ -343,28 +343,46 @@ def _score(req: PredictRequest, pos: List[str], neg: List[str]):
     if description_score <= 0:
         return base_prob, 0.0
 
-    adjusted = max(base_prob, (base_prob * 0.45) + (description_score * 0.55))
+    if description_score >= 0.75:
+        adjusted = max(base_prob, (base_prob * 0.15) + (description_score * 0.85))
+    elif description_score >= 0.55:
+        adjusted = max(base_prob, (base_prob * 0.25) + (description_score * 0.75))
+    else:
+        adjusted = max(base_prob, (base_prob * 0.35) + (description_score * 0.65))
     return min(1.0, adjusted), description_score
 
 
 def _description_alignment(req: PredictRequest):
+    investor_bio = _normalized_text(req.investor_bio or "")
     project_text = _normalized_text(
         f"{req.project_title} {req.project_description} {req.project_category}"
     )
     investor_text = _normalized_text(
-        f"{req.investor_bio or ''} {' '.join(req.investor_industries or [])}"
+        f"{investor_bio} {' '.join(req.investor_industries or [])}"
     )
     if not project_text or not investor_text:
         return 0.0
 
     cosine = _text_cosine_similarity(project_text, investor_text)
     overlap = _token_overlap(project_text, investor_text)
+    coverage = _token_coverage(project_text, investor_text)
     category_mention = (
         1.0 if req.project_category.lower() in investor_text.lower() else 0.0
     )
+    long_phrase_match = _contains_long_phrase(project_text, investor_bio)
 
-    score = min(1.0, (cosine * 0.55) + (overlap * 0.30) + (category_mention * 0.15))
-    if cosine >= 0.80 or overlap >= 0.75:
+    score = min(
+        1.0,
+        (cosine * 0.35)
+        + (overlap * 0.15)
+        + (coverage * 0.40)
+        + (category_mention * 0.10),
+    )
+    if long_phrase_match:
+        score = max(score, 0.82)
+    elif coverage >= 0.80:
+        score = max(score, 0.75)
+    elif cosine >= 0.80 or overlap >= 0.75:
         score = max(score, 0.70)
     return score
 
@@ -404,6 +422,31 @@ def _token_overlap(left: str, right: str):
     if not union:
         return 0.0
     return len(left_tokens & right_tokens) / len(union)
+
+
+def _token_coverage(left: str, right: str):
+    left_tokens = _tokens(left)
+    right_tokens = _tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+
+    intersection = len(left_tokens & right_tokens)
+    smaller = min(len(left_tokens), len(right_tokens))
+    if smaller == 0:
+        return 0.0
+    return intersection / smaller
+
+
+def _contains_long_phrase(left: str, right: str):
+    left_norm = _normalized_text(left.lower())
+    right_norm = _normalized_text(right.lower())
+    if not left_norm or not right_norm:
+        return False
+    if len(_tokens(right_norm)) >= 8 and right_norm in left_norm:
+        return True
+    if len(_tokens(left_norm)) >= 8 and left_norm in right_norm:
+        return True
+    return False
 
 
 def _tokens(text: str):
