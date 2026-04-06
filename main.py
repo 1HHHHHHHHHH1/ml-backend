@@ -205,9 +205,19 @@ def predict(req: PredictRequest):
         raise HTTPException(503, "Model loading... retry in 10 seconds")
 
     pos, neg = _signals(req.project_description)
-    prob, description_score = _score(req, pos, neg)
+    prob, description_score, base_prob = _score(req, pos, neg)
     dec = "INVEST" if prob >= THRESHOLD else "SKIP"
     signals = _positive_signals(pos, req, description_score)
+
+    print(
+        "[predict]",
+        f"investor={req.investor_name!r}",
+        f"base_probability={base_prob:.4f}",
+        f"description_score={description_score:.4f}",
+        f"final_probability={prob:.4f}",
+        f"match_percentage={prob * 100:.1f}%",
+        f"decision={dec}",
+    )
 
     explanation = f"{dec} - {prob * 100:.1f}% with {req.investor_name}. "
     explanation += (
@@ -247,12 +257,25 @@ def predict_bulk(req: BulkRequest):
                 investor_description=inv.get("description", ""),
                 investor_industries=inv.get("industries", []),
             )
-            prob, description_score = _score(single, pos, neg)
+            prob, description_score, base_prob = _score(single, pos, neg)
+            decision = "INVEST" if prob >= THRESHOLD else "SKIP"
+
+            print(
+                "[predict_bulk]",
+                f"investor_id={inv.get('id', '')!r}",
+                f"investor_name={inv.get('name', '')!r}",
+                f"base_probability={base_prob:.4f}",
+                f"description_score={description_score:.4f}",
+                f"final_probability={prob:.4f}",
+                f"match_percentage={prob * 100:.1f}%",
+                f"decision={decision}",
+            )
+
             out.append(
                 BulkResult(
                     investor_id=inv.get("id", ""),
                     investor_name=inv.get("name", ""),
-                    decision="INVEST" if prob >= THRESHOLD else "SKIP",
+                    decision=decision,
                     probability=round(prob, 4),
                     match_percentage=round(prob * 100, 1),
                     confidence_level=_conf(prob),
@@ -343,7 +366,7 @@ def _score(req: PredictRequest, pos: List[str], neg: List[str]):
     base_prob = _proba(_features(req, pos, neg))
     description_score = _description_alignment(req)
     if description_score <= 0:
-        return base_prob, 0.0
+        return base_prob, 0.0, base_prob
 
     if description_score >= 0.75:
         adjusted = max(base_prob, (base_prob * 0.15) + (description_score * 0.85))
@@ -351,7 +374,7 @@ def _score(req: PredictRequest, pos: List[str], neg: List[str]):
         adjusted = max(base_prob, (base_prob * 0.25) + (description_score * 0.75))
     else:
         adjusted = max(base_prob, (base_prob * 0.35) + (description_score * 0.65))
-    return min(1.0, adjusted), description_score
+    return min(1.0, adjusted), description_score, base_prob
 
 
 def _description_alignment(req: PredictRequest):
@@ -452,15 +475,21 @@ def _contains_long_phrase(left: str, right: str):
 
 
 def _tokens(text: str):
+    normalized = _normalized_text(text.lower())
     return {
         token
-        for token in re.split(r"[^a-z0-9]+", text.lower())
-        if len(token) > 2
+        for token in re.findall(r"\w+", normalized, flags=re.UNICODE)
+        if len(token) > 1
     }
 
 
 def _normalized_text(text: str):
-    return " ".join(text.split()).strip()
+    normalized = " ".join(text.split()).strip()
+    normalized = re.sub(r"[\u064B-\u065F\u0670\u06D6-\u06ED]", "", normalized)
+    normalized = normalized.replace("\u0640", "")
+    normalized = re.sub(r"[إأآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ؤ", "و").replace("ئ", "ي")
+    return normalized
 
 
 def _cosine(left, right):
