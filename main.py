@@ -97,10 +97,14 @@ class PredictRequest(BaseModel):
     project_category: str
     funding_goal: float
     project_title: Optional[str] = ""
+    project_stage: Optional[str] = ""
     investor_name: str
     investor_note: Optional[str] = ""
     investor_description: Optional[str] = ""
     investor_industries: List[str] = Field(default_factory=list)
+    investor_stages: List[str] = Field(default_factory=list)
+    investor_min_investment: Optional[float] = None
+    investor_max_investment: Optional[float] = None
 
 
 class PredictResponse(BaseModel):
@@ -118,6 +122,7 @@ class BulkRequest(BaseModel):
     project_category: str
     funding_goal: float
     project_title: Optional[str] = ""
+    project_stage: Optional[str] = ""
     investors: List[dict]
 
 
@@ -205,7 +210,7 @@ def predict(req: PredictRequest):
         raise HTTPException(503, "Model loading... retry in 10 seconds")
 
     pos, neg = _signals(req.project_description)
-    prob, description_score, base_prob = _score(req, pos, neg)
+    prob, description_score, base_prob, stage_score, funding_score = _score(req, pos, neg)
     dec = "INVEST" if prob >= THRESHOLD else "SKIP"
     signals = _positive_signals(pos, req, description_score)
 
@@ -214,6 +219,8 @@ def predict(req: PredictRequest):
         f"investor={req.investor_name!r}",
         f"base_probability={base_prob:.4f}",
         f"description_score={description_score:.4f}",
+        f"stage_score={stage_score:.4f}",
+        f"funding_score={funding_score:.4f}",
         f"final_probability={prob:.4f}",
         f"match_percentage={prob * 100:.1f}%",
         f"decision={dec}",
@@ -252,12 +259,16 @@ def predict_bulk(req: BulkRequest):
                 project_category=req.project_category,
                 funding_goal=req.funding_goal,
                 project_title=req.project_title or "",
+                project_stage=getattr(req, "project_stage", "") or "",
                 investor_name=inv.get("name", ""),
                 investor_note=inv.get("note", inv.get("description", "")),
                 investor_description=inv.get("description", ""),
                 investor_industries=inv.get("industries", []),
+                investor_stages=inv.get("stages", []),
+                investor_min_investment=inv.get("min_investment"),
+                investor_max_investment=inv.get("max_investment"),
             )
-            prob, description_score, base_prob = _score(single, pos, neg)
+            prob, description_score, base_prob, stage_score, funding_score = _score(single, pos, neg)
             decision = "INVEST" if prob >= THRESHOLD else "SKIP"
 
             print(
@@ -266,6 +277,8 @@ def predict_bulk(req: BulkRequest):
                 f"investor_name={inv.get('name', '')!r}",
                 f"base_probability={base_prob:.4f}",
                 f"description_score={description_score:.4f}",
+                f"stage_score={stage_score:.4f}",
+                f"funding_score={funding_score:.4f}",
                 f"final_probability={prob:.4f}",
                 f"match_percentage={prob * 100:.1f}%",
                 f"decision={decision}",
@@ -365,16 +378,38 @@ def _proba(features):
 def _score(req: PredictRequest, pos: List[str], neg: List[str]):
     base_prob = _proba(_features(req, pos, neg))
     description_score = _description_alignment(req)
-    if description_score <= 0:
-        return base_prob, 0.0, base_prob
+    stage_score = _stage_score(req.project_stage or "", req.investor_stages)
+    funding_score = _funding_score(
+        req.funding_goal,
+        req.investor_min_investment,
+        req.investor_max_investment,
+    )
+    probability = base_prob
 
-    if description_score >= 0.75:
-        adjusted = max(base_prob, (base_prob * 0.15) + (description_score * 0.85))
-    elif description_score >= 0.55:
-        adjusted = max(base_prob, (base_prob * 0.25) + (description_score * 0.75))
-    else:
-        adjusted = max(base_prob, (base_prob * 0.35) + (description_score * 0.65))
-    return min(1.0, adjusted), description_score, base_prob
+    if description_score > 0:
+        if description_score >= 0.75:
+            probability = max(base_prob, (base_prob * 0.15) + (description_score * 0.85))
+        elif description_score >= 0.55:
+            probability = max(base_prob, (base_prob * 0.25) + (description_score * 0.75))
+        else:
+            probability = max(base_prob, (base_prob * 0.35) + (description_score * 0.65))
+
+    has_stage = bool((req.project_stage or "").strip() and req.investor_stages)
+    has_funding = (
+        req.investor_min_investment is not None or req.investor_max_investment is not None
+    )
+
+    # Blend in stage and funding as explicit rule-based factors.
+    # If both are available: 65% current probability, 20% stage, 15% funding.
+    if has_stage and has_funding:
+        probability = (probability * 0.65) + (stage_score * 0.20) + (funding_score * 0.15)
+    elif has_stage:
+        probability = (probability * 0.80) + (stage_score * 0.20)
+    elif has_funding:
+        probability = (probability * 0.85) + (funding_score * 0.15)
+
+    probability = min(1.0, max(0.0, probability))
+    return probability, description_score, base_prob, stage_score, funding_score
 
 
 def _description_alignment(req: PredictRequest):
@@ -424,6 +459,47 @@ def _positive_signals(pos: List[str], req: PredictRequest, description_score: fl
 
 def _investor_note(req: PredictRequest):
     return req.investor_note or req.investor_description or ""
+
+
+def _stage_score(project_stage: str, investor_stages: List[str]):
+    if not project_stage or not investor_stages:
+        return 0.0
+
+    normalized_project = _normalize_label(project_stage)
+    normalized_stages = {_normalize_label(value) for value in investor_stages if value}
+    return 1.0 if normalized_project in normalized_stages else 0.0
+
+
+def _funding_score(
+    funding_goal: float,
+    min_investment: Optional[float],
+    max_investment: Optional[float],
+):
+    if funding_goal <= 0:
+        return 0.0
+
+    if min_investment is None and max_investment is None:
+        return 0.0
+
+    lower = 0.0 if min_investment is None else float(min_investment)
+    upper = float("inf") if max_investment is None or max_investment <= 0 else float(max_investment)
+
+    if lower <= funding_goal <= upper:
+        return 1.0
+
+    if funding_goal < lower and lower > 0:
+        gap = (lower - funding_goal) / lower
+        return max(0.0, 1.0 - gap)
+
+    if upper not in (0.0, float("inf")) and funding_goal > upper:
+        gap = (funding_goal - upper) / upper
+        return max(0.0, 1.0 - gap)
+
+    return 0.0
+
+
+def _normalize_label(value: str):
+    return " ".join(value.strip().lower().replace("&", " and ").split())
 
 
 def _text_cosine_similarity(left: str, right: str):
