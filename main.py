@@ -98,7 +98,8 @@ class PredictRequest(BaseModel):
     funding_goal: float
     project_title: Optional[str] = ""
     investor_name: str
-    investor_bio: Optional[str] = ""
+    investor_note: Optional[str] = ""
+    investor_description: Optional[str] = ""
     investor_industries: List[str] = Field(default_factory=list)
 
 
@@ -242,7 +243,8 @@ def predict_bulk(req: BulkRequest):
                 funding_goal=req.funding_goal,
                 project_title=req.project_title or "",
                 investor_name=inv.get("name", ""),
-                investor_bio=inv.get("bio", ""),
+                investor_note=inv.get("note", inv.get("description", "")),
+                investor_description=inv.get("description", ""),
                 investor_industries=inv.get("industries", []),
             )
             prob, description_score = _score(single, pos, neg)
@@ -353,23 +355,19 @@ def _score(req: PredictRequest, pos: List[str], neg: List[str]):
 
 
 def _description_alignment(req: PredictRequest):
-    investor_bio = _normalized_text(req.investor_bio or "")
+    investor_note = _normalized_text(_investor_note(req))
     project_text = _normalized_text(
         f"{req.project_title} {req.project_description} {req.project_category}"
     )
-    investor_text = _normalized_text(
-        f"{investor_bio} {' '.join(req.investor_industries or [])}"
-    )
+    investor_text = investor_note
     if not project_text or not investor_text:
         return 0.0
 
     cosine = _text_cosine_similarity(project_text, investor_text)
     overlap = _token_overlap(project_text, investor_text)
     coverage = _token_coverage(project_text, investor_text)
-    category_mention = (
-        1.0 if req.project_category.lower() in investor_text.lower() else 0.0
-    )
-    long_phrase_match = _contains_long_phrase(project_text, investor_bio)
+    category_mention = 1.0 if req.project_category.lower() in investor_note.lower() else 0.0
+    long_phrase_match = _contains_long_phrase(project_text, investor_note)
 
     score = min(
         1.0,
@@ -393,12 +391,16 @@ def _positive_signals(pos: List[str], req: PredictRequest, description_score: fl
         signals.append("description alignment")
     if (
         req.project_category
-        and req.project_category.lower() in (req.investor_bio or "").lower()
+        and req.project_category.lower() in _investor_note(req).lower()
     ):
-        category_signal = f"bio mentions {req.project_category}"
+        category_signal = f"description mentions {req.project_category}"
         if category_signal not in signals:
             signals.append(category_signal)
     return signals
+
+
+def _investor_note(req: PredictRequest):
+    return req.investor_note or req.investor_description or ""
 
 
 def _text_cosine_similarity(left: str, right: str):
